@@ -3,14 +3,14 @@ use futures::io::Cursor;
 use asynchronous_codec::{Framed, LinesCodec};
 use futures::channel::oneshot;
 use futures_util::FutureExt;
-use async_response_stream::Receiving;
+use async_response_stream::{Error, Receiving};
 
 #[test]
 fn smoke() {
     let mut buffer = Vec::new();
     buffer.extend_from_slice(b"hello\n");
 
-    let future = Receiving::new(Framed::new(Cursor::new(&mut buffer), LinesCodec));
+    let future = Receiving::new(Framed::new(Cursor::new(&mut buffer), LinesCodec), Duration::from_secs(1));
     let (message, slot, response) = future.now_or_never().unwrap().unwrap();
 
     assert_eq!(message, "hello\n");
@@ -26,7 +26,7 @@ async fn runtime_driven() {
     let mut buffer = Vec::new();
     buffer.extend_from_slice(b"hello\n");
 
-    let (message, slot, response) = Receiving::new(Framed::new(Cursor::new(buffer), LinesCodec)).await.unwrap();
+    let (message, slot, response) = Receiving::new(Framed::new(Cursor::new(buffer), LinesCodec), Duration::from_secs(1)).await.unwrap();
 
     assert_eq!(message, "hello\n");
 
@@ -41,4 +41,25 @@ async fn runtime_driven() {
     tokio::time::sleep(Duration::from_millis(100)).await; // simulate computation of response
     slot.fill("world\n".to_owned());
     assert_eq!(tx.await.unwrap(), b"hello\nworld\n");
+}
+
+#[tokio::test]
+async fn timeout() {
+    let mut buffer = Vec::new();
+    buffer.extend_from_slice(b"hello\n");
+
+    let (message, _, response) = Receiving::new(Framed::new(Cursor::new(buffer), LinesCodec), Duration::from_millis(10)).await.unwrap();
+
+    assert_eq!(message, "hello\n");
+
+    let (rx, tx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        let error = response.await.unwrap_err();
+
+        rx.send(error).unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await; // delay response beyond timeout
+    assert!(matches!(tx.await.unwrap(), Error::Timeout));
 }

@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 asynchronous-codec = "0.6.1"
 futures = { version = "0.3.25", default-features = false }
+futures-timer = "3.0.2"
 
 [dev-dependencies]
 futures = "0.3.25"

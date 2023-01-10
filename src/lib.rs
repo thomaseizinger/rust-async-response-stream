@@ -1,4 +1,5 @@
 use std::{io, future::Future, pin::Pin, sync::{Arc, Mutex}, task::{Context, Poll, Waker}, mem};
+use std::time::Duration;
 use asynchronous_codec::{Decoder, Encoder, Framed};
 use futures::{
     AsyncRead,
@@ -6,9 +7,11 @@ use futures::{
     StreamExt,
     SinkExt,
 };
+use futures_timer::Delay;
+use futures::FutureExt;
 
 pub struct Receiving<S, C> {
-    framed: Option<Framed<S, C>>,
+    inner: ReceivingState<S, C>,
 }
 
 pub struct Responding<S, C> where C: Encoder {
@@ -19,6 +22,7 @@ pub struct Responding<S, C> where C: Encoder {
 pub enum Error<Enc> {
     Recv(Enc),
     Send(Enc),
+    Timeout,
 }
 
 pub struct Slot<Res> {
@@ -26,9 +30,9 @@ pub struct Slot<Res> {
 }
 
 impl<S, C> Receiving<S, C> {
-    pub fn new(framed: Framed<S, C>) -> Self {
+    pub fn new(framed: Framed<S, C>, timeout: Duration) -> Self {
         Self {
-            framed: Some(framed)
+            inner: ReceivingState::Receiving { framed, timeout: Delay::new(timeout) }
         }
     }
 }
@@ -36,20 +40,46 @@ impl<S, C> Receiving<S, C> {
 impl<S, C, Req, Res, E> Future for Receiving<S, C> where S: AsyncRead + AsyncWrite + Unpin, C: Encoder<Item=Res, Error=E> + Decoder<Item=Req, Error=E>, E: From<io::Error> {
     type Output = Result<(Req, Slot<Res>, Responding<S, C>), Error<E>>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let framed = self.framed.as_mut().expect("to not be polled after completion");
-        let req = futures::ready!(framed.poll_next_unpin(cx).map_err(Error::Recv)?).ok_or_else(|| Error::Recv(E::from(io::Error::from(io::ErrorKind::UnexpectedEof))))?;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
 
-        let shared = Arc::new(Mutex::new(Shared::default()));
+        loop {
+            match mem::replace(&mut this.inner, ReceivingState::Poisoned) {
+                ReceivingState::Receiving { mut framed, mut timeout } => {
+                    match timeout.poll_unpin(cx) {
+                        Poll::Ready(()) => {
+                            return Poll::Ready(Err(Error::Timeout));
+                        }
+                        Poll::Pending => {}
+                    }
 
-        let fut = Responding {
-            inner: RespondingState::Sending { framed: self.framed.take().expect("to not be polled after completion"), shared: shared.clone() }
-        };
-        let slot = Slot {
-            shared,
-        };
+                    let request = match framed.poll_next_unpin(cx).map_err(Error::Recv)? {
+                        Poll::Ready(Some(request)) => request,
+                        Poll::Ready(None) => {
+                            return Poll::Ready(Err(Error::Recv(E::from(io::Error::from(io::ErrorKind::UnexpectedEof)))));
+                        }
+                        Poll::Pending => {
+                            this.inner = ReceivingState::Receiving { framed, timeout };
+                            return Poll::Pending;
+                        }
+                    };
 
-        Poll::Ready(Ok((req, slot, fut)))
+                    let shared = Arc::new(Mutex::new(Shared::default()));
+
+                    let fut = Responding {
+                        inner: RespondingState::Sending { framed, shared: shared.clone(), timeout }
+                    };
+                    let slot = Slot {
+                        shared,
+                    };
+
+                    return Poll::Ready(Ok((request, slot, fut)));
+                }
+                ReceivingState::Poisoned => {
+                    unreachable!()
+                }
+            }
+        }
     }
 }
 
@@ -61,11 +91,18 @@ impl<S, C, Req, Res, E> Future for Responding<S, C> where S: AsyncRead + AsyncWr
 
         loop {
             match mem::replace(&mut this.inner, RespondingState::Poisoned) {
-                RespondingState::Sending { mut framed, shared } => {
+                RespondingState::Sending { mut framed, shared, mut timeout } => {
+                    match timeout.poll_unpin(cx) {
+                        Poll::Ready(()) => {
+                            return Poll::Ready(Err(Error::Timeout));
+                        }
+                        Poll::Pending => {}
+                    }
+
                     match framed.poll_ready_unpin(cx).map_err(Error::Send)? {
                         Poll::Ready(()) => {}
                         Poll::Pending => {
-                            this.inner = RespondingState::Sending { framed, shared };
+                            this.inner = RespondingState::Sending { framed, shared, timeout };
                             return Poll::Pending;
                         }
                     }
@@ -78,7 +115,7 @@ impl<S, C, Req, Res, E> Future for Responding<S, C> where S: AsyncRead + AsyncWr
                             guard.waker = Some(cx.waker().clone());
                             drop(guard);
 
-                            this.inner = RespondingState::Sending { framed, shared };
+                            this.inner = RespondingState::Sending { framed, shared, timeout };
                             return Poll::Pending;
                         }
                     };
@@ -111,10 +148,19 @@ impl<Res> Slot<Res> {
     }
 }
 
+enum ReceivingState<S, C> {
+    Receiving {
+        framed: Framed<S, C>,
+        timeout: Delay,
+    },
+    Poisoned,
+}
+
 enum RespondingState<S, C> where C: Encoder {
     Sending {
         framed: Framed<S, C>,
         shared: Arc<Mutex<Shared<C::Item>>>,
+        timeout: Delay
     },
     Flushing {
         framed: Framed<S, C>,
