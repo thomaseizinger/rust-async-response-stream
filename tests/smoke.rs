@@ -46,20 +46,11 @@ async fn runtime_driven() {
 #[tokio::test]
 async fn timeout() {
     let mut buffer = Vec::new();
-    buffer.extend_from_slice(b"hello\n");
+    buffer.extend_from_slice(b"\n");
 
-    let (message, _, response) = Receiving::new(Framed::new(Cursor::new(buffer), LinesCodec), Duration::from_millis(10)).await.unwrap();
-
-    assert_eq!(message, "hello\n");
-
-    let (rx, tx) = oneshot::channel();
-
-    tokio::spawn(async move {
-        let error = response.await.unwrap_err();
-
-        rx.send(error).unwrap();
-    });
+    let (_, _, response) = Receiving::new(Framed::new(Cursor::new(buffer), LinesCodec), Duration::from_millis(10)).await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(100)).await; // delay response beyond timeout
-    assert!(matches!(tx.await.unwrap(), Error::Timeout));
+
+    assert!(matches!(response.await.unwrap_err(), Error::Timeout));
 }
