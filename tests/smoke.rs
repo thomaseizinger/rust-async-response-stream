@@ -54,3 +54,18 @@ async fn timeout() {
 
     assert!(matches!(response.await.unwrap_err(), Error::Timeout));
 }
+
+#[tokio::test]
+async fn close_after_send() {
+    let mut buffer = Vec::new();
+    buffer.extend_from_slice(b"hello\n");
+
+    let (_, slot, response) = Receiving::new(Framed::new(Cursor::new(&mut buffer), LinesCodec), Duration::from_millis(10)).await.unwrap();
+
+    slot.fill("world\n".to_owned());
+    response.close_after_send().await.unwrap();
+
+    assert_eq!(buffer, b"hello\nworld\n");
+
+    // TODO: How can we assert that closing works properly?
+}
