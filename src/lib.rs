@@ -39,11 +39,15 @@ pub struct Slot<Res> {
     shared: Arc<Mutex<Shared<Res>>>,
 }
 
-impl<S, C> Receiving<S, C> {
-    pub fn new(framed: Framed<S, C>, timeout: Duration) -> Self {
+impl<S, C> Receiving<S, C>
+where
+    S: AsyncRead + AsyncWrite,
+    C: Encoder + Decoder,
+{
+    pub fn new(stream: S, codec: C, timeout: Duration) -> Self {
         Self {
             inner: ReceivingState::Receiving {
-                framed,
+                framed: Framed::new(stream, codec),
                 timeout: Delay::new(timeout),
             },
         }
