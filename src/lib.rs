@@ -12,10 +12,12 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
+/// A future that waits for an incoming message.
 pub struct Receiving<S, C> {
     inner: ReceivingState<S, C>,
 }
 
+/// A future that waits for the response to be provided via [`Slot::fill`] and will send it over the wrapped stream.
 pub struct Responding<S, C, B>
 where
     C: Encoder,
@@ -24,8 +26,12 @@ where
     behaviour: PhantomData<B>,
 }
 
+/// Marker type for a [`Responding`] future that will return the stream back to the user after the message has been sent.
+///
+/// This may be useful if multiple request-response exchanges should happen on the same stream.
 pub enum ReturnStream {}
 
+/// Marker type for a [`Responding`] future that will close the stream after the message has been sent.
 pub enum CloseStream {}
 
 #[derive(Debug)]
@@ -35,6 +41,7 @@ pub enum Error<Enc> {
     Timeout,
 }
 
+/// The slot for the response to be sent on the stream.
 pub struct Slot<Res> {
     shared: Arc<Mutex<Shared<Res>>>,
 }
@@ -63,6 +70,21 @@ where
         Responding {
             inner: self.inner,
             behaviour: Default::default(),
+        }
+    }
+}
+
+impl<Res> Slot<Res> {
+    /// Fill this slot with a response.
+    ///
+    /// This consumes the slot because a response can only be sent once.
+    /// The actual IO for sending the response happens in the [`Responding`] future.
+    pub fn fill(self, res: Res) {
+        let mut guard = self.shared.lock().unwrap();
+
+        guard.message = Some(res);
+        if let Some(waker) = guard.waker.take() {
+            waker.wake();
         }
     }
 }
@@ -216,17 +238,6 @@ where
                 }
                 RespondingState::Poisoned => unreachable!(),
             }
-        }
-    }
-}
-
-impl<Res> Slot<Res> {
-    pub fn fill(self, res: Res) {
-        let mut guard = self.shared.lock().unwrap();
-
-        guard.message = Some(res);
-        if let Some(waker) = guard.waker.take() {
-            waker.wake();
         }
     }
 }
